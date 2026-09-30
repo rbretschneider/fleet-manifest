@@ -1,0 +1,144 @@
+# Fleet status feed for Nectar Mobile apps. Three ways status.json changes:
+#
+#   1. cron backstop  — every 5 min, probe the sync host's /health from
+#                       GitHub's infrastructure; flip to outage/ok on change.
+#   2. power webhook  — hawaii self-reports UPS events in its ~60s grace
+#                       window via repository_dispatch (event_type: power,
+#                       client_payload.state: onbatt | online).
+#   3. manual switch  — workflow_dispatch sets/clears maintenance mode.
+#
+# Clients read the RAW url (open CORS, ~5 min cache):
+#   https://raw.githubusercontent.com/rbretschneider/nectarmobile-status/main/status.json
+#
+# Manual maintenance wins over the cron: the cron never overwrites a
+# "maintenance" status; clear it via the manual switch with mode=auto.
+
+name: Status monitor
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  repository_dispatch:
+    types: [power]
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "maintenance = show maintenance banner; auto = resume automatic monitoring"
+        type: choice
+        options: [maintenance, auto]
+        required: true
+      message:
+        description: "Maintenance message shown in apps"
+        required: false
+        default: "Down for scheduled maintenance — back soon."
+
+permissions:
+  contents: write
+
+concurrency:
+  group: status
+  cancel-in-progress: false
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Determine desired status
+        id: decide
+        env:
+          EVENT: ${{ github.event_name }}
+          POWER_STATE: ${{ github.event.client_payload.state }}
+          MODE: ${{ inputs.mode }}
+          MESSAGE: ${{ inputs.message }}
+        run: |
+          set -euo pipefail
+          current_status=$(jq -r .status status.json)
+          current_cause=$(jq -r .cause status.json)
+
+          status=""; message=""; cause=""
+          case "$EVENT" in
+            workflow_dispatch)
+              if [ "$MODE" = "maintenance" ]; then
+                status="maintenance"; message="$MESSAGE"; cause="manual"
+              else
+                status="probe"   # fall through to a live probe below
+              fi
+              ;;
+            repository_dispatch)
+              if [ "$POWER_STATE" = "onbatt" ]; then
+                status="outage"
+                message="A power interruption is affecting sync. Your data is safe on your device and will catch up automatically."
+                cause="power"
+              else
+                status="probe"   # power restored: trust a probe, not the event
+              fi
+              ;;
+            schedule)
+              # The cron never overrides an operator's maintenance flag.
+              if [ "$current_status" = "maintenance" ] && [ "$current_cause" = "manual" ]; then
+                echo "skip=true" >> "$GITHUB_OUTPUT"; exit 0
+              fi
+              status="probe"
+              ;;
+          esac
+
+          if [ "$status" = "probe" ]; then
+            healthy=false
+            for attempt in 1 2 3; do
+              if curl -sf --max-time 10 https://sync.nectarmobile.dev/health >/dev/null; then
+                healthy=true; break
+              fi
+              sleep 20
+            done
+            if [ "$healthy" = true ]; then
+              status="ok"; message=""; cause=""
+            else
+              status="outage"
+              message="Sync is temporarily unreachable. Your data is safe on your device and will catch up automatically."
+              cause="probe"
+            fi
+          fi
+
+          if [ "$status" = "$current_status" ]; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          {
+            echo "skip=false"
+            echo "status=$status"
+            echo "message=$message"
+            echo "cause=$cause"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Write and publish status.json
+        if: steps.decide.outputs.skip != 'true'
+        env:
+          STATUS: ${{ steps.decide.outputs.status }}
+          MESSAGE: ${{ steps.decide.outputs.message }}
+          CAUSE: ${{ steps.decide.outputs.cause }}
+        run: |
+          set -euo pipefail
+          jq -n --arg s "$STATUS" --arg m "$MESSAGE" --arg c "$CAUSE" \
+             --arg t "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+             '{status:$s, message:$m, cause:$c, updatedAt:$t}' > status.json
+          git config user.name "status-monitor"
+          git config user.email "status-monitor@users.noreply.github.com"
+          git add status.json
+          git commit -m "status: $STATUS ($CAUSE)"
+          git push
+
+      - name: Keepalive (public-repo cron survives 60-day inactivity)
+        if: steps.decide.outputs.skip == 'true'
+        run: |
+          set -euo pipefail
+          last=$(git log -1 --format=%ct)
+          age_days=$(( ( $(date +%s) - last ) / 86400 ))
+          if [ "$age_days" -ge 45 ]; then
+            date -u +%Y-%m-%dT%H:%M:%SZ > .keepalive
+            git config user.name "status-monitor"
+            git config user.email "status-monitor@users.noreply.github.com"
+            git add .keepalive
+            git commit -m "keepalive"
+            git push
+          fi
